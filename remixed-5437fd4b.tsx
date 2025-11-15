@@ -1,6 +1,75 @@
 import React, { useState, useEffect } from 'react';
 import { Play, Pause, RotateCcw, Users, Plus, X, Clock, BookOpen, ChevronRight, ArrowLeft, LogOut, Mail, Copy, Check, Trash2 } from 'lucide-react';
 
+// Storage abstraction layer that works both in Claude.ai and on external deployments
+const storage = {
+  async get(key, shared = false) {
+    // Check if we're in Claude.ai environment
+    if (typeof window !== 'undefined' && window.storage) {
+      try {
+        return await window.storage.get(key, shared);
+      } catch (err) {
+        return null;
+      }
+    }
+    
+    // Fallback to localStorage for external deployments
+    const storageKey = shared ? `shared:${key}` : key;
+    const value = localStorage.getItem(storageKey);
+    return value ? { key, value, shared } : null;
+  },
+
+  async set(key, value, shared = false) {
+    if (typeof window !== 'undefined' && window.storage) {
+      try {
+        return await window.storage.set(key, value, shared);
+      } catch (err) {
+        console.error('Storage set error:', err);
+        return null;
+      }
+    }
+    
+    const storageKey = shared ? `shared:${key}` : key;
+    localStorage.setItem(storageKey, value);
+    return { key, value, shared };
+  },
+
+  async delete(key, shared = false) {
+    if (typeof window !== 'undefined' && window.storage) {
+      try {
+        return await window.storage.delete(key, shared);
+      } catch (err) {
+        return null;
+      }
+    }
+    
+    const storageKey = shared ? `shared:${key}` : key;
+    localStorage.removeItem(storageKey);
+    return { key, deleted: true, shared };
+  },
+
+  async list(prefix = '', shared = false) {
+    if (typeof window !== 'undefined' && window.storage) {
+      try {
+        return await window.storage.list(prefix, shared);
+      } catch (err) {
+        return { keys: [], prefix, shared };
+      }
+    }
+    
+    // Fallback: scan localStorage for matching keys
+    const storagePrefix = shared ? `shared:${prefix}` : prefix;
+    const keys = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && key.startsWith(storagePrefix)) {
+        keys.push(shared ? key.replace('shared:', '') : key);
+      }
+    }
+    return { keys, prefix, shared };
+  }
+};
+
 export default function BackOnTrack() {
   const [view, setView] = useState('auth');
   const [authMode, setAuthMode] = useState('login');
@@ -26,7 +95,7 @@ export default function BackOnTrack() {
 
   const checkAuth = async () => {
     try {
-      const userData = await window.storage.get('current-user');
+      const userData = await storage.get('current-user');
       if (userData) {
         const user = JSON.parse(userData.value);
         setCurrentUser(user);
@@ -57,15 +126,10 @@ export default function BackOnTrack() {
     }
 
     try {
-      // Check if username exists - this will throw an error if it doesn't exist, which is what we want
-      try {
-        const existingUser = await window.storage.get(`user:${username}`, true);
-        if (existingUser) {
-          setError('Username already exists');
-          return;
-        }
-      } catch (checkErr) {
-        // User doesn't exist, which is good - continue with registration
+      const existingUser = await storage.get(`user:${username}`, true);
+      if (existingUser) {
+        setError('Username already exists');
+        return;
       }
 
       const user = {
@@ -74,8 +138,8 @@ export default function BackOnTrack() {
         createdAt: Date.now()
       };
 
-      await window.storage.set(`user:${username}`, JSON.stringify(user), true);
-      await window.storage.set('current-user', JSON.stringify(user));
+      await storage.set(`user:${username}`, JSON.stringify(user), true);
+      await storage.set('current-user', JSON.stringify(user));
       
       setCurrentUser(user);
       setView('classes');
@@ -93,7 +157,7 @@ export default function BackOnTrack() {
     }
 
     try {
-      const userData = await window.storage.get(`user:${username}`, true);
+      const userData = await storage.get(`user:${username}`, true);
       if (!userData) {
         setError('Invalid username or password');
         return;
@@ -105,7 +169,7 @@ export default function BackOnTrack() {
         return;
       }
 
-      await window.storage.set('current-user', JSON.stringify(user));
+      await storage.set('current-user', JSON.stringify(user));
       setCurrentUser(user);
       loadUserClasses(username);
       setView('classes');
@@ -116,7 +180,7 @@ export default function BackOnTrack() {
 
   const logout = async () => {
     try {
-      await window.storage.delete('current-user');
+      await storage.delete('current-user');
       setCurrentUser(null);
       setUsername('');
       setPassword('');
@@ -130,9 +194,21 @@ export default function BackOnTrack() {
 
   const loadUserClasses = async (user) => {
     try {
-      const classesData = await window.storage.get(`classes:${user}`);
+      const classesData = await storage.get(`classes:${user}`);
       if (classesData) {
-        setMyClasses(JSON.parse(classesData.value));
+        const classes = JSON.parse(classesData.value);
+        // Refresh classroom data from shared storage
+        const refreshedClasses = await Promise.all(
+          classes.map(async (cls) => {
+            try {
+              const classroomData = await storage.get(`classroom:${cls.id}`, true);
+              return classroomData ? JSON.parse(classroomData.value) : cls;
+            } catch {
+              return cls;
+            }
+          })
+        );
+        setMyClasses(refreshedClasses);
       }
     } catch (err) {
       setMyClasses([]);
@@ -159,9 +235,9 @@ export default function BackOnTrack() {
     setNewClassName('');
     
     try {
-      await window.storage.set(`classes:${currentUser.username}`, JSON.stringify(updated));
-      await window.storage.set(`classroom:${classId}`, JSON.stringify(newClass), true);
-      await window.storage.set(`invite:${inviteCode}`, classId, true);
+      await storage.set(`classes:${currentUser.username}`, JSON.stringify(updated));
+      await storage.set(`classroom:${classId}`, JSON.stringify(newClass), true);
+      await storage.set(`invite:${inviteCode}`, classId, true);
     } catch (err) {
       setError('Could not create class');
     }
@@ -174,14 +250,14 @@ export default function BackOnTrack() {
     }
 
     try {
-      const classIdData = await window.storage.get(`invite:${inviteCode.toUpperCase()}`, true);
+      const classIdData = await storage.get(`invite:${inviteCode.toUpperCase()}`, true);
       if (!classIdData) {
         setError('Invalid invite code');
         return;
       }
 
       const classId = classIdData.value;
-      const classData = await window.storage.get(`classroom:${classId}`, true);
+      const classData = await storage.get(`classroom:${classId}`, true);
       
       if (!classData) {
         setError('Classroom not found');
@@ -196,16 +272,17 @@ export default function BackOnTrack() {
       }
 
       classroom.members.push(currentUser.username);
-      await window.storage.set(`classroom:${classId}`, JSON.stringify(classroom), true);
+      await storage.set(`classroom:${classId}`, JSON.stringify(classroom), true);
 
       const updated = [...myClasses, classroom];
       setMyClasses(updated);
-      await window.storage.set(`classes:${currentUser.username}`, JSON.stringify(updated));
+      await storage.set(`classes:${currentUser.username}`, JSON.stringify(updated));
 
       setInviteCode('');
       setError('');
       alert(`Successfully joined ${classroom.name}!`);
     } catch (err) {
+      console.error('Join class error:', err);
       setError('Failed to join class');
     }
   };
@@ -215,17 +292,17 @@ export default function BackOnTrack() {
     setMyClasses(updated);
     
     try {
-      await window.storage.set(`classes:${currentUser.username}`, JSON.stringify(updated));
+      await storage.set(`classes:${currentUser.username}`, JSON.stringify(updated));
       
       if (classData.owner === currentUser.username) {
-        await window.storage.delete(`classroom:${classData.id}`, true);
-        await window.storage.delete(`invite:${classData.inviteCode}`, true);
+        await storage.delete(`classroom:${classData.id}`, true);
+        await storage.delete(`invite:${classData.inviteCode}`, true);
       } else {
-        const classroomData = await window.storage.get(`classroom:${classData.id}`, true);
+        const classroomData = await storage.get(`classroom:${classData.id}`, true);
         if (classroomData) {
           const classroom = JSON.parse(classroomData.value);
           classroom.members = classroom.members.filter(m => m !== currentUser.username);
-          await window.storage.set(`classroom:${classData.id}`, JSON.stringify(classroom), true);
+          await storage.set(`classroom:${classData.id}`, JSON.stringify(classroom), true);
         }
       }
     } catch (err) {
@@ -250,12 +327,12 @@ export default function BackOnTrack() {
     setView('buddies');
     
     try {
-      const result = await window.storage.list(`study:${classData.id}:`, true);
+      const result = await storage.list(`study:${classData.id}:`, true);
       if (result && result.keys) {
         const buddies = await Promise.all(
           result.keys.map(async (key) => {
             try {
-              const data = await window.storage.get(key, true);
+              const data = await storage.get(key, true);
               if (!data) return null;
               const buddy = JSON.parse(data.value);
               if (Date.now() - buddy.lastActive > 300000) return null;
@@ -281,7 +358,7 @@ export default function BackOnTrack() {
     };
     
     try {
-      await window.storage.set(
+      await storage.set(
         `study:${classData.id}:${currentUser.username}`,
         JSON.stringify(myBuddyData),
         true
@@ -302,7 +379,7 @@ export default function BackOnTrack() {
     setView('timer');
     
     try {
-      await window.storage.set(
+      await storage.set(
         `study:${selectedClass.id}:${currentUser.username}`,
         JSON.stringify({
           username: currentUser.username,
@@ -348,7 +425,7 @@ export default function BackOnTrack() {
     if (isRunning && activeSession && currentUser) {
       const updateStatus = async () => {
         try {
-          await window.storage.set(
+          await storage.set(
             `study:${activeSession.class.id}:${currentUser.username}`,
             JSON.stringify({
               username: currentUser.username,
@@ -381,7 +458,7 @@ export default function BackOnTrack() {
     
     if (selectedClass && currentUser) {
       try {
-        await window.storage.delete(
+        await storage.delete(
           `study:${selectedClass.id}:${currentUser.username}`,
           true
         );
